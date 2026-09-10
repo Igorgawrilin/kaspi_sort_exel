@@ -6,6 +6,42 @@ import threading
 import subprocess
 import urllib.error
 import urllib.request
+
+
+def _ensure_tcl_paths():
+    """В exe Tcl/Tk должны браться из текущей распаковки, а не из уже удалённой папки."""
+    if not getattr(sys, "frozen", False):
+        return
+    base = getattr(sys, "_MEIPASS", None)
+    if not base or not os.path.isdir(base):
+        return
+
+    def find_lib(names, marker):
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.isfile(os.path.join(path, marker)):
+                return path
+            if os.path.isdir(path):
+                try:
+                    children = os.listdir(path)
+                except OSError:
+                    continue
+                for child in children:
+                    cand = os.path.join(path, child)
+                    if os.path.isfile(os.path.join(cand, marker)):
+                        return cand
+        return None
+
+    tcl = find_lib(("_tcl_data", "tcl", "tcl8.6", "tcl8"), "init.tcl")
+    tk = find_lib(("_tk_data", "tk", "tk8.6", "tk8"), "tk.tcl")
+    if tcl:
+        os.environ["TCL_LIBRARY"] = tcl
+    if tk:
+        os.environ["TK_LIBRARY"] = tk
+
+
+_ensure_tcl_paths()
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -1604,13 +1640,37 @@ class ProductApp:
     def _restart_after_script_update(self):
         self.update_status_var.set("Перезапуск...")
         try:
+            env = os.environ.copy()
+            for key in list(env):
+                if key.startswith("_MEI") or key.startswith("_PYI"):
+                    env.pop(key, None)
+            for key in (
+                "TCL_LIBRARY",
+                "TK_LIBRARY",
+                "TIX_LIBRARY",
+                "TCLLIBPATH",
+                "PYTHONHOME",
+                "PYTHONPATH",
+            ):
+                env.pop(key, None)
+
+            kwargs = {
+                "cwd": app_dir(),
+                "env": env,
+                "close_fds": True,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                )
+
             if getattr(sys, "frozen", False):
-                subprocess.Popen([sys.executable], cwd=app_dir(), close_fds=True)
+                subprocess.Popen([sys.executable], **kwargs)
             else:
                 subprocess.Popen(
                     [sys.executable, os.path.abspath(__file__)],
-                    cwd=app_dir(),
-                    close_fds=True
+                    **kwargs
                 )
         except OSError as exc:
             self._update_failed(exc)
