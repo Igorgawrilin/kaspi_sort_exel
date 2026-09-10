@@ -68,9 +68,6 @@ def get_github_repo():
     return GITHUB_REPO
 
 
-APP_VERSION = read_app_version()
-
-
 def parse_version(text):
     text = str(text or "").strip().lstrip("vV")
     parts = []
@@ -89,6 +86,9 @@ def parse_version(text):
 
 def version_newer(latest, current):
     return parse_version(latest) > parse_version(current)
+
+
+APP_VERSION = read_app_version()
 
 try:
     from openpyxl import load_workbook, Workbook
@@ -115,6 +115,7 @@ class ProductApp:
         self._update_busy = False
 
         self.setup_style()
+        self.setup_clipboard()
         self.build_ui()
         self.load_products()
 
@@ -171,6 +172,124 @@ class ProductApp:
         style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
         style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+
+    def setup_clipboard(self):
+        """Вставка/копирование в ttk.Entry: Ctrl+V и меню по правому клику."""
+
+        def widget_of(event):
+            widget = event.widget
+            if isinstance(widget, (ttk.Entry, tk.Entry)):
+                return widget
+            return None
+
+        def delete_selection(widget):
+            try:
+                widget.delete("sel.first", "sel.last")
+                return True
+            except tk.TclError:
+                return False
+
+        def copy_text(widget):
+            try:
+                text = widget.selection_get()
+            except tk.TclError:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+
+        def paste_text(widget):
+            try:
+                text = self.root.clipboard_get()
+            except tk.TclError:
+                return
+            if text is None:
+                return
+            text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+            if "\n" in text:
+                text = text.split("\n", 1)[0]
+            delete_selection(widget)
+            widget.insert("insert", text)
+
+        def cut_text(widget):
+            copy_text(widget)
+            delete_selection(widget)
+
+        def select_all(widget):
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+
+        def on_copy(event):
+            widget = widget_of(event)
+            if widget is None:
+                return
+            copy_text(widget)
+            return "break"
+
+        def on_paste(event):
+            widget = widget_of(event)
+            if widget is None:
+                return
+            paste_text(widget)
+            return "break"
+
+        def on_cut(event):
+            widget = widget_of(event)
+            if widget is None:
+                return
+            cut_text(widget)
+            return "break"
+
+        def on_select_all(event):
+            widget = widget_of(event)
+            if widget is None:
+                return
+            select_all(widget)
+            return "break"
+
+        def show_menu(event):
+            widget = widget_of(event)
+            if widget is None:
+                return
+            widget.focus_set()
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(label="Вырезать", command=lambda: cut_text(widget))
+            menu.add_command(label="Копировать", command=lambda: copy_text(widget))
+            menu.add_command(label="Вставить", command=lambda: paste_text(widget))
+            menu.add_separator()
+            menu.add_command(label="Выделить всё", command=lambda: select_all(widget))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        sequences = {
+            on_paste: (
+                "<Control-v>", "<Control-V>",
+                "<Control-м>", "<Control-М>",
+                "<Shift-Insert>",
+            ),
+            on_copy: (
+                "<Control-c>", "<Control-C>",
+                "<Control-с>", "<Control-С>",
+                "<Control-Insert>",
+            ),
+            on_cut: (
+                "<Control-x>", "<Control-X>",
+                "<Control-ч>", "<Control-Ч>",
+            ),
+            on_select_all: (
+                "<Control-a>", "<Control-A>",
+                "<Control-ф>", "<Control-Ф>",
+            ),
+        }
+
+        for cls_name in ("TEntry", "Entry"):
+            self.root.bind_class(cls_name, "<Button-3>", show_menu)
+            for handler, keys in sequences.items():
+                for key in keys:
+                    self.root.bind_class(cls_name, key, handler)
 
     def build_ui(self):
         header = ttk.Frame(self.root, padding=(20, 18, 20, 10))
