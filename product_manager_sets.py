@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import sqlite3
+import tempfile
 import threading
 import subprocess
 import urllib.error
@@ -53,6 +54,58 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def data_dir():
+    """Служебные файлы обновления — не рядом с exe."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+    path = os.path.join(base, "ProductManager")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cleanup_app_folder():
+    """Удаляет служебные файлы обновления из папки с exe."""
+    hidden = data_dir()
+    folder = app_dir()
+
+    for name in (LOCAL_UPDATE_SCRIPT, "version.txt", "update_repo.txt"):
+        src = os.path.join(folder, name)
+        dst = os.path.join(hidden, name)
+        if os.path.isfile(src) and not os.path.isfile(dst):
+            try:
+                os.replace(src, dst)
+            except OSError:
+                try:
+                    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                        fdst.write(fsrc.read())
+                except OSError:
+                    pass
+
+    leftovers = (
+        "app_latest.py",
+        "app_latest.py.tmp",
+        "app_latest.py.bad",
+        "version.txt",
+        "apply_update.bat",
+        "ProductManager_new.exe",
+        "Tovary_new.exe",
+        "update_repo.txt",
+    )
+    for name in leftovers:
+        path = os.path.join(folder, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def resource_path(name):
     """Файл из сборки PyInstaller (иконка и т.п.)."""
     if getattr(sys, "frozen", False):
@@ -75,6 +128,7 @@ APP_NAME = "Product Manager"
 
 def read_app_version():
     candidates = [
+        os.path.join(data_dir(), "version.txt"),
         os.path.join(app_dir(), "version.txt"),
         resource_path("version.txt"),
     ]
@@ -92,7 +146,9 @@ def read_app_version():
 
 
 def get_github_repo():
-    override = os.path.join(app_dir(), "update_repo.txt")
+    override = os.path.join(data_dir(), "update_repo.txt")
+    if not os.path.isfile(override):
+        override = os.path.join(app_dir(), "update_repo.txt")
     if os.path.isfile(override):
         try:
             with open(override, encoding="utf-8") as f:
@@ -1621,9 +1677,9 @@ class ProductApp:
         ).start()
 
     def _download_and_apply_update(self, info):
-        dest = os.path.join(app_dir(), LOCAL_UPDATE_SCRIPT)
+        dest = os.path.join(data_dir(), LOCAL_UPDATE_SCRIPT)
         temp_dest = dest + ".tmp"
-        version_path = os.path.join(app_dir(), "version.txt")
+        version_path = os.path.join(data_dir(), "version.txt")
         try:
             req = urllib.request.Request(
                 info["url"],
@@ -1660,38 +1716,28 @@ class ProductApp:
     def _restart_after_script_update(self):
         self.update_status_var.set("Перезапуск...")
         try:
-            env = os.environ.copy()
-            for key in list(env):
-                if key.startswith("_MEI") or key.startswith("_PYI"):
-                    env.pop(key, None)
-            for key in (
-                "TCL_LIBRARY",
-                "TK_LIBRARY",
-                "TIX_LIBRARY",
-                "TCLLIBPATH",
-                "PYTHONHOME",
-                "PYTHONPATH",
-            ):
-                env.pop(key, None)
+            if getattr(sys, "frozen", False):
+                target = f'"{sys.executable}"'
+            else:
+                target = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
 
-            kwargs = {
-                "cwd": app_dir(),
-                "env": env,
-                "close_fds": True,
-            }
+            bat_path = os.path.join(tempfile.gettempdir(), "pm_restart.bat")
+            bat = (
+                "@echo off\r\n"
+                "ping 127.0.0.1 -n 3 >nul\r\n"
+                f'start "" {target}\r\n'
+                "del \"%~f0\"\r\n"
+            )
+            with open(bat_path, "w", encoding="ascii", newline="\r\n") as f:
+                f.write(bat)
+
+            kwargs = {"cwd": tempfile.gettempdir(), "close_fds": True}
             if os.name == "nt":
                 kwargs["creationflags"] = (
                     getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
                 )
-
-            if getattr(sys, "frozen", False):
-                subprocess.Popen([sys.executable], **kwargs)
-            else:
-                subprocess.Popen(
-                    [sys.executable, os.path.abspath(__file__)],
-                    **kwargs
-                )
+            subprocess.Popen(["cmd.exe", "/c", bat_path], **kwargs)
         except OSError as exc:
             self._update_failed(exc)
             return
@@ -1708,9 +1754,16 @@ def _run_downloaded_script():
         return False
     if not getattr(sys, "frozen", False):
         return False
-    updated = os.path.join(app_dir(), LOCAL_UPDATE_SCRIPT)
+    updated = os.path.join(data_dir(), LOCAL_UPDATE_SCRIPT)
     if not os.path.isfile(updated):
-        return False
+        legacy = os.path.join(app_dir(), LOCAL_UPDATE_SCRIPT)
+        if os.path.isfile(legacy):
+            try:
+                os.replace(legacy, updated)
+            except OSError:
+                updated = legacy
+        else:
+            return False
     os.environ["PM_BOOTSTRAPPED"] = "1"
     import runpy
     try:
@@ -1718,7 +1771,7 @@ def _run_downloaded_script():
         return True
     except Exception:
         try:
-            os.replace(updated, updated + ".bad")
+            os.remove(updated)
         except OSError:
             pass
         return False
@@ -1726,6 +1779,7 @@ def _run_downloaded_script():
 
 if __name__ == "__main__":
     if not _run_downloaded_script():
+        cleanup_app_folder()
         root = tk.Tk()
         app = ProductApp(root)
         root.mainloop()
