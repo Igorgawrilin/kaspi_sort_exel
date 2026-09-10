@@ -2,6 +2,10 @@ import os
 import sys
 import json
 import sqlite3
+import threading
+import subprocess
+import urllib.error
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -24,6 +28,68 @@ def resource_path(name):
 
 DB_FILE = os.path.join(app_dir(), "products.db")
 
+# Репозиторий GitHub в формате владелец/имя.
+# Можно также положить рядом с exe файл update_repo.txt с этой строкой.
+GITHUB_REPO = "Igorgawrilin/kaspi_sort_exel"
+GITHUB_BRANCH = "gh_pages"
+UPDATE_SCRIPT_NAME = "product_manager_sets.py"
+LOCAL_UPDATE_SCRIPT = "app_latest.py"
+APP_NAME = "Product Manager"
+
+
+def read_app_version():
+    candidates = [
+        os.path.join(app_dir(), "version.txt"),
+        resource_path("version.txt"),
+    ]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                value = f.read().strip().splitlines()[0].strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "1.0.0"
+
+
+def get_github_repo():
+    override = os.path.join(app_dir(), "update_repo.txt")
+    if os.path.isfile(override):
+        try:
+            with open(override, encoding="utf-8") as f:
+                value = f.read().strip()
+            if "/" in value and "YOUR_GITHUB" not in value:
+                return value
+        except OSError:
+            pass
+    return GITHUB_REPO
+
+
+APP_VERSION = read_app_version()
+
+
+def parse_version(text):
+    text = str(text or "").strip().lstrip("vV")
+    parts = []
+    for chunk in text.split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts or [0])
+
+
+def version_newer(latest, current):
+    return parse_version(latest) > parse_version(current)
+
 try:
     from openpyxl import load_workbook, Workbook
 except ImportError:
@@ -34,7 +100,7 @@ except ImportError:
 class ProductApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Товары — Артикулы")
+        self.root.title(f"{APP_NAME}  v{APP_VERSION}")
         self.root.geometry("1100x700")
         self.root.minsize(950, 600)
         self.apply_app_icon()
@@ -45,12 +111,15 @@ class ProductApp:
         self.external_entries = []
         self.excel_files = []
         self.excel_result = []
+        self.latest_update = None
+        self._update_busy = False
 
         self.setup_style()
         self.build_ui()
         self.load_products()
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(800, self.check_for_updates_async)
 
     def apply_app_icon(self):
         icon_ico = resource_path("app.ico")
@@ -97,6 +166,8 @@ class ProductApp:
 
         style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
         style.configure("Subtitle.TLabel", font=("Segoe UI", 10))
+        style.configure("Version.TLabel", font=("Segoe UI", 9), foreground="#666666")
+        style.configure("Update.TLabel", font=("Segoe UI", 10, "bold"), foreground="#0a7a2f")
         style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
         style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
@@ -105,7 +176,45 @@ class ProductApp:
         header = ttk.Frame(self.root, padding=(20, 18, 20, 10))
         header.pack(fill="x")
 
-        ttk.Label(header, text="Управление товарами", style="Title.TLabel").pack(anchor="w")
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x")
+
+        ttk.Label(
+            title_row, text=APP_NAME, style="Title.TLabel"
+        ).pack(side="left", anchor="w")
+
+        update_box = ttk.Frame(title_row)
+        update_box.pack(side="right", anchor="e")
+
+        self.version_label = ttk.Label(
+            update_box,
+            text=f"Версия {APP_VERSION}",
+            style="Version.TLabel"
+        )
+        self.version_label.pack(side="left", padx=(0, 10))
+
+        self.update_status_var = tk.StringVar(value="")
+        self.update_status_label = ttk.Label(
+            update_box,
+            textvariable=self.update_status_var,
+            style="Version.TLabel"
+        )
+        self.update_status_label.pack(side="left", padx=(0, 8))
+
+        self.update_button = ttk.Button(
+            update_box,
+            text="Обновить",
+            command=self.start_update,
+            state="disabled"
+        )
+        self.update_button.pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            update_box,
+            text="Проверить",
+            command=self.check_for_updates_async
+        ).pack(side="left")
+
         ttk.Label(
             header,
             text="Внутренний артикул + любое количество внешних артикулов",
@@ -1226,12 +1335,199 @@ class ProductApp:
             f"Итоговая таблица сохранена в «Загрузки»:\n\n{path}"
         )
 
+    # -------------------- ОБНОВЛЕНИЯ --------------------
+
+    def check_for_updates_async(self):
+        if self._update_busy:
+            return
+        repo = get_github_repo()
+        if not repo or "YOUR_GITHUB" in repo:
+            self.update_status_var.set("Репозиторий не указан")
+            return
+        self.update_status_var.set("Проверка обновлений...")
+        self.update_button.config(state="disabled")
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _github_json(self, url):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"ProductManager/{APP_VERSION}",
+                "Accept": "application/vnd.github+json",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _read_text_url(self, url):
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"ProductManager/{APP_VERSION}"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8").strip()
+
+    def _check_branch_version(self, repo):
+        version_url = (
+            f"https://raw.githubusercontent.com/{repo}/"
+            f"{GITHUB_BRANCH}/version.txt"
+        )
+        script_url = (
+            f"https://raw.githubusercontent.com/{repo}/"
+            f"{GITHUB_BRANCH}/{UPDATE_SCRIPT_NAME}"
+        )
+        latest = self._read_text_url(version_url).splitlines()[0].strip()
+        return {
+            "version": latest,
+            "url": script_url,
+            "notes": "Обновление кода с GitHub (.py).",
+        }
+
+    def _check_for_updates(self):
+        repo = get_github_repo()
+        try:
+            info = self._check_branch_version(repo)
+            self.root.after(0, lambda: self._apply_update_info(info))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                msg = "На GitHub нет version.txt или .py"
+            else:
+                msg = f"GitHub ответил ошибкой {exc.code}"
+            self.root.after(0, lambda m=msg: self._set_update_idle(m))
+        except (urllib.error.URLError, TimeoutError, OSError):
+            self.root.after(0, lambda: self._set_update_idle("Нет связи с GitHub"))
+
+    def _set_update_idle(self, text):
+        self.latest_update = None
+        self.update_status_var.set(text)
+        self.update_status_label.configure(style="Version.TLabel")
+        self.update_button.config(state="disabled")
+
+    def _apply_update_info(self, info):
+        latest = info.get("version") or ""
+        if not latest:
+            self._set_update_idle("Не удалось прочитать версию")
+            return
+
+        if not version_newer(latest, APP_VERSION):
+            self._set_update_idle("Установлена последняя версия")
+            return
+
+        self.latest_update = info
+        self.update_status_var.set(f"Доступна {latest}")
+        self.update_status_label.configure(style="Update.TLabel")
+        if info.get("url") and getattr(sys, "frozen", False):
+            self.update_button.config(state="normal")
+        elif info.get("url"):
+            self.update_button.config(state="normal")
+        else:
+            self.update_button.config(state="disabled")
+
+    def start_update(self):
+        info = self.latest_update
+        if not info or not info.get("url"):
+            messagebox.showinfo("Обновление", "Сначала проверьте наличие обновления.")
+            return
+
+        if self._update_busy:
+            return
+
+        notes = info.get("notes") or "Новая версия программы."
+        if len(notes) > 600:
+            notes = notes[:600] + "..."
+        if not messagebox.askyesno(
+            "Обновление",
+            f"Установить версию {info.get('version')}?\n\n"
+            f"{notes}\n\n"
+            "Скачается только код (.py). Программа перезапустится.\n"
+            "База products.db сохранится."
+        ):
+            return
+
+        self._update_busy = True
+        self.update_button.config(state="disabled")
+        self.update_status_var.set("Скачивание...")
+        threading.Thread(
+            target=self._download_and_apply_update,
+            args=(info,),
+            daemon=True
+        ).start()
+
+    def _download_and_apply_update(self, info):
+        dest = os.path.join(app_dir(), LOCAL_UPDATE_SCRIPT)
+        temp_dest = dest + ".tmp"
+        version_path = os.path.join(app_dir(), "version.txt")
+        try:
+            req = urllib.request.Request(
+                info["url"],
+                headers={"User-Agent": f"ProductManager/{APP_VERSION}"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            text = data.decode("utf-8")
+            if "class ProductApp" not in text or len(text) < 1000:
+                raise OSError("Скачанный файл не похож на программу")
+            with open(temp_dest, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.replace(temp_dest, dest)
+            with open(version_path, "w", encoding="utf-8") as f:
+                f.write(str(info.get("version") or "").strip() + "\n")
+        except Exception as exc:
+            try:
+                if os.path.exists(temp_dest):
+                    os.remove(temp_dest)
+            except OSError:
+                pass
+            self.root.after(0, lambda e=exc: self._update_failed(e))
+            return
+
+        self.root.after(0, self._restart_after_script_update)
+
+    def _update_failed(self, exc):
+        self._update_busy = False
+        self.update_status_var.set("Ошибка обновления")
+        if self.latest_update:
+            self.update_button.config(state="normal")
+        messagebox.showerror("Обновление", f"Не удалось скачать обновление:\n\n{exc}")
+
+    def _restart_after_script_update(self):
+        self.update_status_var.set("Перезапуск...")
+        try:
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable], cwd=app_dir(), close_fds=True)
+            else:
+                subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__)],
+                    cwd=app_dir(),
+                    close_fds=True
+                )
+        except OSError as exc:
+            self._update_failed(exc)
+            return
+        self.close()
+
     def close(self):
         self.conn.close()
         self.root.destroy()
 
 
+def _run_downloaded_script():
+    """Exe запускает свежий .py из папки, если он уже скачан с GitHub."""
+    if os.environ.get("PM_BOOTSTRAPPED") == "1":
+        return False
+    if not getattr(sys, "frozen", False):
+        return False
+    updated = os.path.join(app_dir(), LOCAL_UPDATE_SCRIPT)
+    if not os.path.isfile(updated):
+        return False
+    os.environ["PM_BOOTSTRAPPED"] = "1"
+    import runpy
+    runpy.run_path(updated, run_name="__main__")
+    return True
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ProductApp(root)
-    root.mainloop()
+    if not _run_downloaded_script():
+        root = tk.Tk()
+        app = ProductApp(root)
+        root.mainloop()
