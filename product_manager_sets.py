@@ -265,31 +265,23 @@ class ProductApp:
             return "break"
 
         sequences = {
-            on_paste: (
-                "<Control-v>", "<Control-V>",
-                "<Control-м>", "<Control-М>",
-                "<Shift-Insert>",
-            ),
-            on_copy: (
-                "<Control-c>", "<Control-C>",
-                "<Control-с>", "<Control-С>",
-                "<Control-Insert>",
-            ),
-            on_cut: (
-                "<Control-x>", "<Control-X>",
-                "<Control-ч>", "<Control-Ч>",
-            ),
-            on_select_all: (
-                "<Control-a>", "<Control-A>",
-                "<Control-ф>", "<Control-Ф>",
-            ),
+            on_paste: ("<Control-v>", "<Control-V>", "<Shift-Insert>"),
+            on_copy: ("<Control-c>", "<Control-C>", "<Control-Insert>"),
+            on_cut: ("<Control-x>", "<Control-X>"),
+            on_select_all: ("<Control-a>", "<Control-A>"),
         }
 
         for cls_name in ("TEntry", "Entry"):
-            self.root.bind_class(cls_name, "<Button-3>", show_menu)
+            try:
+                self.root.bind_class(cls_name, "<Button-3>", show_menu)
+            except tk.TclError:
+                pass
             for handler, keys in sequences.items():
                 for key in keys:
-                    self.root.bind_class(cls_name, key, handler)
+                    try:
+                        self.root.bind_class(cls_name, key, handler)
+                    except tk.TclError:
+                        pass
 
     def build_ui(self):
         header = ttk.Frame(self.root, padding=(20, 18, 20, 10))
@@ -1641,8 +1633,15 @@ def _run_downloaded_script():
         return False
     os.environ["PM_BOOTSTRAPPED"] = "1"
     import runpy
-    runpy.run_path(updated, run_name="__main__")
-    return True
+    try:
+        runpy.run_path(updated, run_name="__main__")
+        return True
+    except Exception:
+        try:
+            os.replace(updated, updated + ".bad")
+        except OSError:
+            pass
+        return False
 
 
 if __name__ == "__main__":
