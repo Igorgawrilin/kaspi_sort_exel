@@ -210,77 +210,105 @@ class ProductApp:
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
     def setup_clipboard(self):
-        """Вставка/копирование в ttk.Entry: Ctrl+V и меню по правому клику."""
+        """Вставка и копирование в поля: Ctrl+C/V/X/A, Shift+Insert, правое меню."""
 
         def widget_of(event):
             widget = event.widget
-            if isinstance(widget, (ttk.Entry, tk.Entry)):
-                return widget
+            if isinstance(widget, str):
+                try:
+                    widget = self.root.nametowidget(widget)
+                except tk.TclError:
+                    return None
+            try:
+                if widget.winfo_class() in ("TEntry", "Entry"):
+                    return widget
+            except tk.TclError:
+                return None
             return None
+
+        def get_clipboard():
+            for kind in ("STRING", "UTF8_STRING", "TEXT"):
+                try:
+                    value = self.root.clipboard_get(type=kind)
+                    if value:
+                        return value
+                except tk.TclError:
+                    pass
+            try:
+                return self.root.clipboard_get()
+            except tk.TclError:
+                return ""
 
         def delete_selection(widget):
             try:
                 widget.delete("sel.first", "sel.last")
-                return True
             except tk.TclError:
-                return False
+                pass
 
         def copy_text(widget):
             try:
                 text = widget.selection_get()
             except tk.TclError:
                 return
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update_idletasks()
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update_idletasks()
+            except tk.TclError:
+                pass
 
         def paste_text(widget):
-            try:
-                text = self.root.clipboard_get()
-            except tk.TclError:
-                return
-            if text is None:
+            text = get_clipboard()
+            if not text:
                 return
             text = str(text).replace("\r\n", "\n").replace("\r", "\n")
             if "\n" in text:
                 text = text.split("\n", 1)[0]
             delete_selection(widget)
-            widget.insert("insert", text)
+            try:
+                widget.insert("insert", text)
+            except tk.TclError:
+                try:
+                    widget.event_generate("<<Paste>>")
+                except tk.TclError:
+                    pass
 
         def cut_text(widget):
             copy_text(widget)
             delete_selection(widget)
 
         def select_all(widget):
-            widget.selection_range(0, "end")
-            widget.icursor("end")
+            try:
+                widget.selection_range(0, "end")
+                widget.icursor("end")
+            except tk.TclError:
+                pass
 
-        def on_copy(event):
+        def on_ctrl_key(event):
             widget = widget_of(event)
             if widget is None:
                 return
-            copy_text(widget)
-            return "break"
+            keysym = (event.keysym or "").lower()
+            keycode = getattr(event, "keycode", 0)
+            # На Windows keycode не зависит от русской раскладки: V=86, C=67, X=88, A=65
+            if keycode == 86 or keysym == "v":
+                paste_text(widget)
+                return "break"
+            if keycode == 67 or keysym == "c":
+                copy_text(widget)
+                return "break"
+            if keycode == 88 or keysym == "x":
+                cut_text(widget)
+                return "break"
+            if keycode == 65 or keysym == "a":
+                select_all(widget)
+                return "break"
 
-        def on_paste(event):
+        def on_shift_insert(event):
             widget = widget_of(event)
             if widget is None:
                 return
             paste_text(widget)
-            return "break"
-
-        def on_cut(event):
-            widget = widget_of(event)
-            if widget is None:
-                return
-            cut_text(widget)
-            return "break"
-
-        def on_select_all(event):
-            widget = widget_of(event)
-            if widget is None:
-                return
-            select_all(widget)
             return "break"
 
         def show_menu(event):
@@ -300,24 +328,16 @@ class ProductApp:
                 menu.grab_release()
             return "break"
 
-        sequences = {
-            on_paste: ("<Control-v>", "<Control-V>", "<Shift-Insert>"),
-            on_copy: ("<Control-c>", "<Control-C>", "<Control-Insert>"),
-            on_cut: ("<Control-x>", "<Control-X>"),
-            on_select_all: ("<Control-a>", "<Control-A>"),
-        }
-
         for cls_name in ("TEntry", "Entry"):
-            try:
-                self.root.bind_class(cls_name, "<Button-3>", show_menu)
-            except tk.TclError:
-                pass
-            for handler, keys in sequences.items():
-                for key in keys:
-                    try:
-                        self.root.bind_class(cls_name, key, handler)
-                    except tk.TclError:
-                        pass
+            for sequence, handler in (
+                ("<Control-KeyPress>", on_ctrl_key),
+                ("<Shift-Insert>", on_shift_insert),
+                ("<Button-3>", show_menu),
+            ):
+                try:
+                    self.root.bind_class(cls_name, sequence, handler)
+                except tk.TclError:
+                    pass
 
     def build_ui(self):
         header = ttk.Frame(self.root, padding=(20, 18, 20, 10))
