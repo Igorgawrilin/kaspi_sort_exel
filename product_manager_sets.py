@@ -1047,7 +1047,7 @@ class ProductApp:
 
         ttk.Label(
             info,
-            text="Можно загрузить от 1 до 3 Excel-файлов (.xlsx).\n"
+            text="Можно загрузить любое количество Excel-файлов (.xlsx).\n"
                  "Из каждого файла используются столбцы «Товаров» и "
                  "«Артикул в системе партнера».\n"
                  "Один внешний артикул может быть указан у нескольких товаров: "
@@ -1059,12 +1059,18 @@ class ProductApp:
         files_frame.columnconfigure(0, weight=1)
 
         self.excel_listbox = tk.Listbox(
-            files_frame, height=4, font=("Segoe UI", 10)
+            files_frame, height=6, font=("Segoe UI", 10)
         )
-        self.excel_listbox.grid(row=0, column=0, sticky="ew")
+        excel_files_scroll = ttk.Scrollbar(
+            files_frame, orient="vertical", command=self.excel_listbox.yview
+        )
+        self.excel_listbox.configure(yscrollcommand=excel_files_scroll.set)
+        self.excel_listbox.grid(row=0, column=0, sticky="nsew")
+        excel_files_scroll.grid(row=0, column=1, sticky="ns")
+        files_frame.rowconfigure(0, weight=1)
 
         files_buttons = ttk.Frame(files_frame)
-        files_buttons.grid(row=0, column=1, sticky="ns", padx=(10, 0))
+        files_buttons.grid(row=0, column=2, sticky="ns", padx=(10, 0))
 
         ttk.Button(
             files_buttons,
@@ -1095,7 +1101,7 @@ class ProductApp:
         ).pack(side="left")
 
         self.excel_status_var = tk.StringVar(
-            value="Загрузите 1–3 Excel-файла."
+            value="Добавьте один или несколько Excel-файлов."
         )
         ttk.Label(
             process, textvariable=self.excel_status_var
@@ -1146,14 +1152,6 @@ class ProductApp:
             )
             return
 
-        remaining = 3 - len(self.excel_files)
-        if remaining <= 0:
-            messagebox.showinfo(
-                "Лимит",
-                "Можно загрузить максимум 3 Excel-файла."
-            )
-            return
-
         files = filedialog.askopenfilenames(
             title="Выберите Excel-файлы",
             filetypes=[
@@ -1163,8 +1161,6 @@ class ProductApp:
         )
 
         for path in files:
-            if len(self.excel_files) >= 3:
-                break
             if path not in self.excel_files:
                 self.excel_files.append(path)
 
@@ -1195,10 +1191,10 @@ class ProductApp:
             self.excel_listbox.insert(tk.END, os.path.basename(path))
 
         if not self.excel_files:
-            self.excel_status_var.set("Загрузите 1–3 Excel-файла.")
+            self.excel_status_var.set("Добавьте один или несколько Excel-файлов.")
         else:
             self.excel_status_var.set(
-                f"Выбрано файлов: {len(self.excel_files)} из 3"
+                f"Выбрано файлов: {len(self.excel_files)}"
             )
 
     @staticmethod
