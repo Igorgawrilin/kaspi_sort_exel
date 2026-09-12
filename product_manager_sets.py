@@ -84,30 +84,6 @@ def persist_runtime():
             pass
 
 
-def apply_persistent_runtime():
-    persist_runtime()
-    search_roots = [runtime_dir()]
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        search_roots.append(meipass)
-
-    tcl = None
-    tk = None
-    for root in search_roots:
-        if tcl is None:
-            tcl = _find_lib_dir(root, ("init.tcl", "auto.tcl"))
-        if tk is None:
-            tk = _find_lib_dir(root, ("tk.tcl",))
-        if tcl and tk:
-            break
-    if tcl:
-        os.environ["TCL_LIBRARY"] = tcl
-    if tk:
-        os.environ["TK_LIBRARY"] = tk
-
-
-apply_persistent_runtime()
-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -273,6 +249,10 @@ class ProductApp:
         self.setup_clipboard()
         self.build_ui()
         self.load_products()
+        try:
+            persist_runtime()
+        except Exception:
+            pass
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(800, self.check_for_updates_async)
