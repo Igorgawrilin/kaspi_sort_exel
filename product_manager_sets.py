@@ -2,17 +2,16 @@ import os
 import sys
 import json
 import sqlite3
+import shutil
 import tempfile
 import threading
 import subprocess
 import urllib.error
 import urllib.request
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 
 
 def app_dir():
-    """Папка, где лежит exe или исходный .py — здесь хранится products.db."""
+    """Папка, где лежит exe или исходный .py."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +32,86 @@ def data_dir():
     return path
 
 
+def runtime_dir():
+    path = os.path.join(data_dir(), "runtime")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _find_lib_dir(root, required, max_depth=4):
+    if not root or not os.path.isdir(root):
+        return None
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if all(name in filenames for name in required):
+            return dirpath
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= max_depth:
+            dirnames[:] = []
+    return None
+
+
+def persist_runtime():
+    """Копирует Tcl/Tk из текущей распаковки exe в AppData."""
+    if not getattr(sys, "frozen", False):
+        return
+    src_root = getattr(sys, "_MEIPASS", None)
+    if not src_root or not os.path.isdir(src_root):
+        return
+    dest_root = runtime_dir()
+    names = (
+        "_tcl_data",
+        "_tk_data",
+        "tcl",
+        "tk",
+        "tcl8",
+        "tcl8.6",
+        "tk8.6",
+    )
+    for name in names:
+        src = os.path.join(src_root, name)
+        dest = os.path.join(dest_root, name)
+        if not os.path.isdir(src):
+            continue
+        try:
+            if os.path.isdir(dest) and _find_lib_dir(dest, ("init.tcl",), max_depth=3):
+                continue
+            if os.path.isdir(dest):
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(src, dest)
+        except OSError:
+            pass
+
+
+def apply_persistent_runtime():
+    persist_runtime()
+    search_roots = [runtime_dir()]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        search_roots.append(meipass)
+
+    tcl = None
+    tk = None
+    for root in search_roots:
+        if tcl is None:
+            tcl = _find_lib_dir(root, ("init.tcl", "auto.tcl"))
+        if tk is None:
+            tk = _find_lib_dir(root, ("tk.tcl",))
+        if tcl and tk:
+            break
+    if tcl:
+        os.environ["TCL_LIBRARY"] = tcl
+    if tk:
+        os.environ["TK_LIBRARY"] = tk
+
+
+apply_persistent_runtime()
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+
 def cleanup_app_folder():
     """Удаляет служебные файлы обновления из папки с exe."""
     hidden = data_dir()
@@ -50,6 +129,14 @@ def cleanup_app_folder():
                         fdst.write(fsrc.read())
                 except OSError:
                     pass
+
+    db_src = os.path.join(folder, "products.db")
+    db_dst = os.path.join(hidden, "products.db")
+    if os.path.isfile(db_src) and not os.path.isfile(db_dst):
+        try:
+            shutil.copy2(db_src, db_dst)
+        except OSError:
+            pass
 
     leftovers = (
         "app_latest.py",
@@ -79,7 +166,19 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
-DB_FILE = os.path.join(app_dir(), "products.db")
+def resolve_db_file():
+    dest = os.path.join(data_dir(), "products.db")
+    src = os.path.join(app_dir(), "products.db")
+    if os.path.isfile(src) and os.path.abspath(src) != os.path.abspath(dest):
+        if not os.path.isfile(dest):
+            try:
+                shutil.copy2(src, dest)
+            except OSError:
+                return src
+    return dest
+
+
+DB_FILE = resolve_db_file()
 
 # Репозиторий GitHub в формате владелец/имя.
 # Можно также положить рядом с exe файл update_repo.txt с этой строкой.
@@ -1622,8 +1721,8 @@ class ProductApp:
             "Обновление",
             f"Установить версию {info.get('version')}?\n\n"
             f"{notes}\n\n"
-            "Скачается только код (.py). Программа перезапустится.\n"
-            "База products.db сохранится."
+            "Скачается код (.py), рабочее окружение сохранится в AppData.\n"
+            "База products.db тоже будет в скрытой папке."
         ):
             return
 
@@ -1655,6 +1754,7 @@ class ProductApp:
             os.replace(temp_dest, dest)
             with open(version_path, "w", encoding="utf-8") as f:
                 f.write(str(info.get("version") or "").strip() + "\n")
+            persist_runtime()
         except Exception as exc:
             try:
                 if os.path.exists(temp_dest):
