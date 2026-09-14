@@ -173,23 +173,32 @@ LOCAL_UPDATE_SCRIPT = "app_latest.py"
 APP_NAME = "Product Manager"
 
 
+def _version_from_file(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip().splitlines()[0].strip()
+    except OSError:
+        return ""
+
+
+def bundled_app_version():
+    return _version_from_file(resource_path("version.txt")) or "1.0.0"
+
+
+def update_app_version():
+    return _version_from_file(os.path.join(data_dir(), "version.txt"))
+
+
 def read_app_version():
-    candidates = [
-        os.path.join(data_dir(), "version.txt"),
-        os.path.join(app_dir(), "version.txt"),
-        resource_path("version.txt"),
-    ]
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                value = f.read().strip().splitlines()[0].strip()
-            if value:
-                return value
-        except OSError:
-            pass
-    return "1.0.0"
+    bundled = bundled_app_version()
+    updated = update_app_version()
+    if updated and version_newer(updated, bundled):
+        return updated
+    if bundled:
+        return bundled
+    return updated or "1.0.0"
 
 
 def get_github_repo():
@@ -260,7 +269,7 @@ def extract_receipt_products(pdf_path):
         if not line:
             continue
         match = re.match(
-            r"^(.*?)\s*(?:\.+\s*)+\d+\s*шт\.?\s*$",
+            r"^(.*?)\s*(?:\.+\s*)+(\d+)\s*шт\.?\s*$",
             line,
             re.IGNORECASE,
         )
@@ -268,7 +277,7 @@ def extract_receipt_products(pdf_path):
             continue
         product = re.sub(r"\s*\.+\s*$", "", match.group(1).strip())
         if product:
-            products.append(product)
+            products.append((product, int(match.group(2))))
     return products
 
 
@@ -1998,12 +2007,13 @@ class ProductApp:
         for pdf_path in self.pdf_files:
             products = extract_receipt_products(pdf_path)
             if len(products) == 1:
-                single.append((products[0], pdf_path))
+                name, quantity = products[0]
+                single.append((name, quantity, pdf_path))
             elif len(products) > 1:
                 multiple.append((products, pdf_path))
             else:
                 unknown.append(pdf_path)
-        single.sort(key=lambda item: item[0].lower())
+        single.sort(key=lambda item: (item[0].lower(), -item[1]))
         self.root.after(
             0, lambda: self.pdf_scan_finished(single, multiple, unknown)
         )
@@ -2013,7 +2023,7 @@ class ProductApp:
         self.pdf_multiple = multiple
         self.pdf_unknown = unknown
         self.pdf_processing = False
-        unique_products = len({name for name, _ in single})
+        unique_products = len({name for name, _qty, _path in single})
         self.pdf_products_var.set(
             f"Товаров найдено: {unique_products}  |  "
             f"Один товар: {len(single)} чеков  |  "
@@ -2057,7 +2067,7 @@ class ProductApp:
 
         output = fitz.open()
         try:
-            for _name, pdf_path in self.pdf_single:
+            for _name, _qty, pdf_path in self.pdf_single:
                 source = fitz.open(pdf_path)
                 output.insert_pdf(source)
                 source.close()
@@ -2341,6 +2351,8 @@ def _run_downloaded_script():
                 updated = legacy
         else:
             return False
+    if not version_newer(update_app_version(), bundled_app_version()):
+        return False
     os.environ["PM_BOOTSTRAPPED"] = "1"
     import runpy
     try:
