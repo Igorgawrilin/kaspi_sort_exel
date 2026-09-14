@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import sqlite3
@@ -8,6 +9,7 @@ import threading
 import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def app_dir():
@@ -86,6 +88,12 @@ def persist_runtime():
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
 
 
 def cleanup_app_folder():
@@ -227,6 +235,114 @@ except ImportError:
     load_workbook = None
     Workbook = None
 
+try:
+    import fitz
+except ImportError:
+    fitz = None
+
+
+def extract_receipt_products(pdf_path):
+    """Названия товаров из чека Kaspi: «Название .... 4 шт.»."""
+    if fitz is None:
+        return []
+    try:
+        document = fitz.open(pdf_path)
+        full_text = ""
+        for page in document:
+            full_text += page.get_text("text") + "\n"
+        document.close()
+    except Exception:
+        return []
+
+    products = []
+    for line in full_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(
+            r"^(.*?)\s*(?:\.+\s*)+\d+\s*шт\.?\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        product = re.sub(r"\s*\.+\s*$", "", match.group(1).strip())
+        if product:
+            products.append(product)
+    return products
+
+
+def _folder_if_valid(value):
+    if not value:
+        return None
+    text = str(value).strip().strip('"')
+    if not text:
+        return None
+    path = Path(text)
+    try:
+        path = path.expanduser()
+    except Exception:
+        return None
+    if path.is_dir():
+        return path
+    if path.is_file():
+        return path.parent
+    return None
+
+
+def get_folder_from_clipboard(root=None):
+    """Папка из буфера: Проводник (Ctrl+C) или текстовый путь."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            CF_HDROP = 15
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = wintypes.BOOL
+            user32.GetClipboardData.argtypes = [wintypes.UINT]
+            user32.GetClipboardData.restype = wintypes.HANDLE
+            user32.CloseClipboard.restype = wintypes.BOOL
+            shell32.DragQueryFileW.argtypes = [
+                wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT
+            ]
+            shell32.DragQueryFileW.restype = wintypes.UINT
+
+            if user32.OpenClipboard(None):
+                try:
+                    handle = user32.GetClipboardData(CF_HDROP)
+                    if handle:
+                        count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+                        if count:
+                            length = shell32.DragQueryFileW(handle, 0, None, 0)
+                            buf = ctypes.create_unicode_buffer(length + 2)
+                            shell32.DragQueryFileW(handle, 0, buf, length + 2)
+                            folder = _folder_if_valid(buf.value)
+                            if folder:
+                                return folder
+                finally:
+                    user32.CloseClipboard()
+        except Exception:
+            pass
+
+    if root is not None:
+        for kind in ("STRING", "UTF8_STRING", "TEXT"):
+            try:
+                folder = _folder_if_valid(root.clipboard_get(type=kind))
+            except tk.TclError:
+                folder = None
+            if folder:
+                return folder
+        try:
+            folder = _folder_if_valid(root.clipboard_get())
+            if folder:
+                return folder
+        except tk.TclError:
+            pass
+    return None
+
 
 class ProductApp:
     def __init__(self, root):
@@ -242,6 +358,13 @@ class ProductApp:
         self.external_entries = []
         self.excel_files = []
         self.excel_result = []
+        self.pdf_selected_folder = None
+        self.pdf_result_file = None
+        self.pdf_files = []
+        self.pdf_single = []
+        self.pdf_multiple = []
+        self.pdf_unknown = []
+        self.pdf_processing = False
         self.latest_update = None
         self._update_busy = False
 
@@ -487,16 +610,22 @@ class ProductApp:
             style="Subtitle.TLabel"
         ).pack(anchor="w", pady=(3, 0))
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=20, pady=(5, 20))
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=(5, 20))
 
-        products_tab = ttk.Frame(notebook, padding=15)
-        notebook.add(products_tab, text="  Товары  ")
+        products_tab = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(products_tab, text="  Товары  ")
         self.build_products_tab(products_tab)
 
-        excel_tab = ttk.Frame(notebook, padding=15)
-        notebook.add(excel_tab, text="  Обработка Excel  ")
+        excel_tab = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(excel_tab, text="  Обработка Excel  ")
         self.build_excel_tab(excel_tab)
+
+        self.pdf_tab = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(self.pdf_tab, text="  Сортировка PDF  ")
+        self.build_pdf_tab(self.pdf_tab)
+        self.root.bind_all("<Control-v>", self.pdf_on_ctrl_v, add="+")
+        self.root.bind_all("<Control-V>", self.pdf_on_ctrl_v, add="+")
 
     # -------------------- РАЗДЕЛ 1 --------------------
 
@@ -1597,6 +1726,414 @@ class ProductApp:
             f"Итоговая таблица сохранена в «Загрузки»:\n\n{path}"
         )
 
+    # -------------------- РАЗДЕЛ 3: PDF --------------------
+
+    def build_pdf_tab(self, parent):
+        bg = "#f4f5f7"
+        shell = tk.Frame(parent, bg=bg)
+        shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            shell,
+            text="Сортировщик чеков Kaspi",
+            font=("Segoe UI", 24, "bold"),
+            bg=bg,
+            fg="#202124",
+        ).pack(pady=(22, 4))
+
+        tk.Label(
+            shell,
+            text="Перетащите папку с чеками сюда, нажмите «Выбрать папку» или Ctrl + V",
+            font=("Segoe UI", 11),
+            bg=bg,
+            fg="#6b7280",
+        ).pack(pady=(0, 16))
+
+        drop = tk.Frame(
+            shell,
+            bg="#ffffff",
+            highlightbackground="#b9bec8",
+            highlightthickness=2,
+            cursor="hand2",
+        )
+        drop.pack(padx=70, fill="x")
+
+        drop_label = tk.Label(
+            drop,
+            text="📁\n\nПЕРЕТАЩИТЕ ПАПКУ СЮДА",
+            font=("Segoe UI", 16, "bold"),
+            bg="#ffffff",
+            fg="#4b5563",
+            justify="center",
+            cursor="hand2",
+        )
+        drop_label.pack(pady=(28, 8))
+
+        drop_hint = tk.Label(
+            drop,
+            text="или скопируйте папку в Проводнике → Ctrl + V",
+            font=("Segoe UI", 10),
+            bg="#ffffff",
+            fg="#9ca3af",
+            cursor="hand2",
+        )
+        drop_hint.pack(pady=(0, 12))
+
+        choose = tk.Button(
+            drop,
+            text="ВЫБРАТЬ ПАПКУ",
+            command=self.pdf_choose_folder,
+            font=("Segoe UI", 11, "bold"),
+            bg="#111827",
+            fg="white",
+            activebackground="#374151",
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            padx=16,
+            pady=8,
+        )
+        choose.pack(pady=(0, 20))
+
+        for widget in (drop, drop_label, drop_hint):
+            widget.bind("<Button-1>", lambda _e: self.pdf_choose_folder())
+
+        self.pdf_enable_drop(drop, drop_label, drop_hint, choose)
+
+        info = tk.Frame(shell, bg=bg)
+        info.pack(fill="x", padx=80, pady=18)
+
+        self.pdf_folder_var = tk.StringVar(value="Папка не выбрана")
+        self.pdf_files_var = tk.StringVar(value="")
+        self.pdf_products_var = tk.StringVar(value="")
+        self.pdf_status_var = tk.StringVar(value="Ожидание папки...")
+
+        tk.Label(
+            info,
+            textvariable=self.pdf_folder_var,
+            font=("Segoe UI", 12, "bold"),
+            bg=bg,
+            fg="#202124",
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            info,
+            textvariable=self.pdf_files_var,
+            font=("Segoe UI", 11),
+            bg=bg,
+            fg="#4b5563",
+            anchor="w",
+        ).pack(fill="x", pady=(5, 0))
+        tk.Label(
+            info,
+            textvariable=self.pdf_products_var,
+            font=("Segoe UI", 11),
+            bg=bg,
+            fg="#4b5563",
+            anchor="w",
+        ).pack(fill="x", pady=(3, 0))
+
+        self.pdf_status_label = tk.Label(
+            shell,
+            textvariable=self.pdf_status_var,
+            font=("Segoe UI", 10),
+            bg=bg,
+            fg="#6b7280",
+        )
+        self.pdf_status_label.pack(pady=(0, 8))
+
+        buttons = tk.Frame(shell, bg=bg)
+        buttons.pack(pady=(0, 20))
+
+        self.pdf_action_button = tk.Button(
+            buttons,
+            text="СОЗДАТЬ",
+            command=self.pdf_on_action,
+            font=("Segoe UI", 12, "bold"),
+            width=18,
+            height=2,
+            bg="#111827",
+            fg="white",
+            activebackground="#374151",
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+        self.pdf_action_button.pack(side="left", padx=8)
+
+        self.pdf_reset_button = tk.Button(
+            buttons,
+            text="СБРОС",
+            command=self.pdf_reset,
+            font=("Segoe UI", 12, "bold"),
+            width=18,
+            height=2,
+            bg="#e5e7eb",
+            fg="#111827",
+            activebackground="#d1d5db",
+            relief="flat",
+            cursor="hand2",
+        )
+        self.pdf_reset_button.pack(side="left", padx=8)
+
+        for widget in (shell, drop, drop_label, drop_hint, info, buttons):
+            widget.bind("<Control-v>", self.pdf_on_ctrl_v)
+            widget.bind("<Control-V>", self.pdf_on_ctrl_v)
+        parent.bind("<Control-v>", self.pdf_on_ctrl_v)
+        parent.bind("<Control-V>", self.pdf_on_ctrl_v)
+
+    def pdf_enable_drop(self, *widgets):
+        if DND_FILES is None:
+            return
+        if not hasattr(self.root, "drop_target_register"):
+            return
+        for widget in widgets:
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self.pdf_on_drop)
+            except tk.TclError:
+                pass
+
+    def pdf_on_drop(self, event):
+        if self.pdf_processing:
+            return
+        raw = getattr(event, "data", "") or ""
+        try:
+            paths = self.root.tk.splitlist(raw)
+        except tk.TclError:
+            paths = [raw.strip("{}")]
+        if not paths:
+            return
+        folder = _folder_if_valid(paths[0])
+        if folder:
+            self.pdf_select_folder(folder)
+        else:
+            messagebox.showwarning(
+                "Нужна папка",
+                "Перетащите именно папку с PDF-чеками.",
+            )
+
+    def pdf_choose_folder(self):
+        if self.pdf_processing:
+            return
+        folder = filedialog.askdirectory(
+            parent=self.root,
+            title="Папка с PDF-чеками",
+            mustexist=True,
+        )
+        if folder:
+            self.pdf_select_folder(Path(folder))
+
+    def pdf_paste_folder(self):
+        self.pdf_on_ctrl_v()
+
+    def pdf_tab_selected(self):
+        try:
+            return str(self.notebook.select()) == str(self.pdf_tab)
+        except Exception:
+            return False
+
+    def pdf_on_ctrl_v(self, event=None):
+        if not self.pdf_tab_selected():
+            return
+        widget = getattr(event, "widget", None) if event else None
+        try:
+            class_name = widget.winfo_class() if widget else ""
+        except tk.TclError:
+            class_name = ""
+        if class_name in ("TEntry", "Entry", "Text", "TCombobox"):
+            return
+        if self.pdf_processing:
+            return "break"
+        folder = get_folder_from_clipboard(self.root)
+        if folder:
+            self.pdf_select_folder(folder)
+        else:
+            messagebox.showinfo(
+                "Папка не найдена",
+                "Скопируйте папку в Проводнике через Ctrl+C,\n"
+                "затем на вкладке «Сортировка PDF» нажмите Ctrl+V.\n"
+                "Либо нажмите «Выбрать папку».",
+            )
+        return "break"
+
+    def pdf_select_folder(self, folder):
+        if fitz is None:
+            messagebox.showerror(
+                "Нет PyMuPDF",
+                "Для сортировки PDF нужна библиотека pymupdf.\n"
+                "Установите новую сборку через ProductManagerSetup.exe.",
+            )
+            return
+
+        folder = Path(folder)
+        pdf_files = [
+            path for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ]
+        if not pdf_files:
+            messagebox.showwarning(
+                "PDF не найдены",
+                "В выбранной папке нет PDF-файлов.",
+            )
+            return
+
+        self.pdf_selected_folder = folder
+        self.pdf_files = sorted(pdf_files)
+        self.pdf_result_file = None
+        self.pdf_folder_var.set(f"Папка: {folder}")
+        self.pdf_files_var.set(f"PDF-файлов: {len(pdf_files)}")
+        self.pdf_products_var.set("Считывание чеков...")
+        self.pdf_status_var.set("Считываю содержимое чеков...")
+        self.pdf_action_button.config(state="disabled", text="СЧИТЫВАНИЕ...")
+        self.pdf_processing = True
+
+        threading.Thread(target=self.pdf_scan_folder, daemon=True).start()
+
+    def pdf_scan_folder(self):
+        single = []
+        multiple = []
+        unknown = []
+        for pdf_path in self.pdf_files:
+            products = extract_receipt_products(pdf_path)
+            if len(products) == 1:
+                single.append((products[0], pdf_path))
+            elif len(products) > 1:
+                multiple.append((products, pdf_path))
+            else:
+                unknown.append(pdf_path)
+        single.sort(key=lambda item: item[0].lower())
+        self.root.after(
+            0, lambda: self.pdf_scan_finished(single, multiple, unknown)
+        )
+
+    def pdf_scan_finished(self, single, multiple, unknown):
+        self.pdf_single = single
+        self.pdf_multiple = multiple
+        self.pdf_unknown = unknown
+        self.pdf_processing = False
+        unique_products = len({name for name, _ in single})
+        self.pdf_products_var.set(
+            f"Товаров найдено: {unique_products}  |  "
+            f"Один товар: {len(single)} чеков  |  "
+            f"Несколько товаров: {len(multiple)}  |  "
+            f"Нераспознанные: {len(unknown)}"
+        )
+        self.pdf_status_var.set("Проверка завершена. Можно создавать итоговый PDF.")
+        self.pdf_action_button.config(state="normal", text="СОЗДАТЬ")
+
+    def pdf_on_action(self):
+        if self.pdf_result_file:
+            self.pdf_download_result()
+        else:
+            self.pdf_create_result()
+
+    def pdf_create_result(self):
+        if not self.pdf_selected_folder or self.pdf_processing:
+            return
+        self.pdf_processing = True
+        self.pdf_action_button.config(state="disabled", text="СОЗДАНИЕ...")
+        self.pdf_status_var.set("Создаю итоговый PDF...")
+        threading.Thread(target=self.pdf_create_thread, daemon=True).start()
+
+    def pdf_create_thread(self):
+        folder = self.pdf_selected_folder
+        output_file = folder.parent / (folder.name + ".pdf")
+        if output_file.exists():
+            try:
+                output_file.unlink()
+            except OSError:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка",
+                        "Не удалось заменить существующий итоговый PDF.\n"
+                        "Закройте его, если он открыт.",
+                    ),
+                )
+                self.root.after(0, self.pdf_reset_after_error)
+                return
+
+        output = fitz.open()
+        try:
+            for _name, pdf_path in self.pdf_single:
+                source = fitz.open(pdf_path)
+                output.insert_pdf(source)
+                source.close()
+            for _products, pdf_path in self.pdf_multiple:
+                source = fitz.open(pdf_path)
+                output.insert_pdf(source)
+                source.close()
+            for pdf_path in self.pdf_unknown:
+                source = fitz.open(pdf_path)
+                output.insert_pdf(source)
+                source.close()
+            output.save(output_file, garbage=4, deflate=True)
+            output.close()
+            self.root.after(0, lambda: self.pdf_creation_finished(output_file))
+        except Exception as exc:
+            try:
+                output.close()
+            except Exception:
+                pass
+            self.root.after(
+                0,
+                lambda e=exc: messagebox.showerror("Ошибка создания PDF", str(e)),
+            )
+            self.root.after(0, self.pdf_reset_after_error)
+
+    def pdf_creation_finished(self, output_file):
+        self.pdf_processing = False
+        self.pdf_result_file = output_file
+        self.pdf_status_var.set("Готово. Итоговый PDF создан.")
+        self.pdf_action_button.config(state="normal", text="СКАЧАТЬ")
+        messagebox.showinfo(
+            "Готово",
+            f"Файл создан:\n\n{output_file}\n\n"
+            "Нажмите «СКАЧАТЬ», чтобы скопировать его в «Загрузки».",
+        )
+
+    def pdf_reset_after_error(self):
+        self.pdf_processing = False
+        self.pdf_action_button.config(
+            state="normal" if self.pdf_selected_folder else "disabled",
+            text="СОЗДАТЬ",
+        )
+        self.pdf_status_var.set("Готово к новой обработке.")
+
+    def pdf_download_result(self):
+        if not self.pdf_result_file or not Path(self.pdf_result_file).exists():
+            messagebox.showerror("Ошибка", "Итоговый PDF не найден.")
+            return
+        downloads = Path(self.get_downloads_folder())
+        downloads.mkdir(parents=True, exist_ok=True)
+        destination = Path(
+            self.unique_download_path(str(downloads), Path(self.pdf_result_file).name)
+        )
+        try:
+            shutil.copy2(self.pdf_result_file, destination)
+        except OSError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            return
+        self.pdf_status_var.set(f"Сохранено в «Загрузки»: {destination.name}")
+        messagebox.showinfo("Готово", f"Файл скопирован в:\n\n{destination}")
+
+    def pdf_reset(self):
+        if self.pdf_processing:
+            return
+        self.pdf_selected_folder = None
+        self.pdf_result_file = None
+        self.pdf_files = []
+        self.pdf_single = []
+        self.pdf_multiple = []
+        self.pdf_unknown = []
+        self.pdf_folder_var.set("Папка не выбрана")
+        self.pdf_files_var.set("")
+        self.pdf_products_var.set("")
+        self.pdf_status_var.set("Ожидание папки с PDF-чеками.")
+        self.pdf_action_button.config(state="disabled", text="СОЗДАТЬ")
+
     # -------------------- ОБНОВЛЕНИЯ --------------------
 
     def check_for_updates_async(self):
@@ -1820,6 +2357,6 @@ def _run_downloaded_script():
 if __name__ == "__main__":
     if not _run_downloaded_script():
         cleanup_app_folder()
-        root = tk.Tk()
+        root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
         app = ProductApp(root)
         root.mainloop()
